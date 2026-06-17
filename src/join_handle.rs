@@ -71,18 +71,24 @@ where
         }
     };
 
-    crate::NEXT_ID.with(|next| {
+    // Allocate a fresh task id from the monotonic counter.  We insert into
+    // the slab at *that exact key* with `insert_at` so the task keeps the
+    // same id across any future remove/re-insert cycles during polling.
+    let id = crate::NEXT_ID.with(|next| {
         let id = *next.borrow();
         *next.borrow_mut() = id.wrapping_add(1);
-        // Register the executor-owned `Rc<TaskWaker>` for this task.
-        crate::WAKERS.with(|w| {
-            w.borrow_mut().insert(id, crate::waker::make_waker_data(id));
-        });
-        crate::READY_QUEUE.with(|q| q.borrow_mut().push_back(id));
-        crate::TASKS.with(|t| {
-            t.borrow_mut().insert(id, Box::pin(wrapped));
-        });
+        id
     });
+    crate::TASKS.with(|t| {
+        t.borrow_mut().insert_at(
+            id,
+            crate::TaskEntry {
+                future: Box::pin(wrapped),
+                waker: crate::waker::make_waker_data(id),
+            },
+        );
+    });
+    crate::READY_QUEUE.with(|q| q.borrow_mut().push_back(id));
 
     JoinHandle { shared }
 }

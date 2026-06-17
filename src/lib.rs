@@ -25,6 +25,7 @@
 mod channel;
 mod executor;
 mod join_handle;
+mod slab;
 mod sleep;
 mod waker;
 
@@ -35,11 +36,13 @@ pub use sleep::sleep;
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     pin::Pin,
     rc::Rc,
     task::Waker,
 };
+
+use crate::slab::Slab;
 
 // ---------------------------------------------------------------------------
 // Thread-local runtime state
@@ -50,14 +53,29 @@ use std::{
 
 pub(crate) type BoxFuture<'a, T = ()> = Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
 
-thread_local! {
-    /// Map from task id → pinned future.  Removed while polling, re-inserted if Pending.
-    pub(crate) static TASKS: RefCell<HashMap<usize, BoxFuture<'static>>> = RefCell::new(HashMap::new());
+/// One live task: the pinned future plus the executor-owned `Rc<TaskWaker>`
+/// that keeps it alive across polls.
+///
+/// We store both in a single `Slab` entry so the executor can look up *all*
+/// per-task state with one indexed load — no second hashmap lookup, no risk
+/// of the two slabs disagreeing on which slot a task lives in.
+pub(crate) struct TaskEntry {
+    pub future: BoxFuture<'static>,
+    pub waker: Rc<waker::TaskWaker>,
+}
 
-    /// Map from task id → the `Rc<TaskWaker>` the executor holds.  We keep one
-    /// strong reference per task; the `Waker`s handed to futures are clones of
-    /// this.  When the task completes, this `Rc` is dropped.
-    pub(crate) static WAKERS: RefCell<HashMap<usize, Rc<waker::TaskWaker>>> = RefCell::new(HashMap::new());
+thread_local! {
+    /// Slab of live tasks, indexed by task id.  Slot `id` is removed while a
+    /// task is being polled (the executor owns the entry for that brief
+    /// window) and re-inserted at the *same* slot if the task yields with
+    /// `Pending`.
+    ///
+    /// We use a `Slab` rather than a `HashMap` because task ids are dense and
+    /// sequential: lookups are a single bounds-checked index, with no hashing
+    /// and no rehash pauses, and the data sits in a contiguous `Vec` for
+    /// excellent cache behaviour.  See [`crate::slab`] for details.
+    pub(crate) static TASKS: RefCell<Slab<TaskEntry>> =
+        const { RefCell::new(Slab::new()) };
 
     /// Timer wheel: deadline → list of wakers to fire when the deadline passes.
     pub(crate) static TIMERS: RefCell<BTreeMap<std::time::Instant, Vec<Waker>>> =
@@ -66,9 +84,12 @@ thread_local! {
     /// FIFO queue of task ids ready to be polled.
     pub(crate) static READY_QUEUE: RefCell<VecDeque<usize>> = const { RefCell::new(VecDeque::new()) };
 
-    /// Monotonically increasing task-id counter.  Task 0 is reserved for the
-    /// "main" future spawned implicitly by `run_blocking`.
-    pub(crate) static NEXT_ID: RefCell<usize> = const { RefCell::new(1) };
+    /// Monotonically increasing task-id counter.  Task ids are allocated by
+    /// `fetch_add`-style increments here and used as slab keys via
+    /// `Slab::insert_at`, so a task keeps the **same** id across remove /
+    /// re-insert cycles during polling.  `wrapping_add` avoids panics on
+    /// extremely long-lived executors.
+    pub(crate) static NEXT_ID: RefCell<usize> = const { RefCell::new(0) };
 }
 
 // ---------------------------------------------------------------------------

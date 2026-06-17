@@ -18,7 +18,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{sleep, waker, JoinHandle, READY_QUEUE, TASKS, TIMERS, WAKERS};
+use crate::{sleep, waker, JoinHandle, READY_QUEUE, TASKS, TIMERS};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -58,20 +58,22 @@ where
 
             let Some(id) = task_id else { break };
 
-            let task_opt = TASKS.with(|t| t.borrow_mut().remove(&id));
+            // Take the task out of the slab for the duration of this poll.
+            // If it returns `Pending`, we put it back at the **same** slot
+            // so the task keeps its id (and the waker's task_id stays valid).
+            let task_opt = TASKS.with(|t| t.borrow_mut().remove(id));
 
-            if let Some(mut fut) = task_opt {
+            if let Some(mut entry) = task_opt {
                 // Build a waker from the executor-owned `Rc<TaskWaker>`.
-                let waker = WAKERS.with(|w| {
-                    let wk = w.borrow();
-                    waker::build_waker(wk.get(&id).expect("waker for task"))
-                });
+                let waker = waker::build_waker(&entry.waker);
                 let mut cx = Context::from_waker(&waker);
 
-                if fut.as_mut().poll(&mut cx).is_pending() {
-                    // Re-insert at the *back* for round-robin fairness.
-                    TASKS.with(|t| t.borrow_mut().insert(id, fut));
+                if entry.future.as_mut().poll(&mut cx).is_pending() {
+                    // Re-insert at the SAME slot so the id is preserved.
+                    TASKS.with(|t| t.borrow_mut().insert_at(id, entry));
                 }
+                // If Ready, `entry` drops here, releasing the `Rc<TaskWaker>`
+                // and the `Box<dyn Future>`.
             }
 
             // Early exit: did the main future finish during this poll cycle?
@@ -119,7 +121,6 @@ fn try_return_main<T>(handle: &JoinHandle<T>) -> bool {
 fn unwrap_main<T>(handle: JoinHandle<T>) -> T {
     let res = handle.shared.borrow_mut().result.take().unwrap();
     TASKS.with(|t| t.borrow_mut().clear());
-    WAKERS.with(|w| w.borrow_mut().clear());
     TIMERS.with(|t| t.borrow_mut().clear());
     res
 }

@@ -18,7 +18,9 @@ Gracio implements a complete async runtime — executor, wakers, timers, and cha
 - ⏱️ **`sleep`** — timer-based suspension with `std::thread::sleep` CPU efficiency
 - 📡 **`bounded_channel`** — async MPSC with backpressure and FIFO waker fairness
 - 🔗 **`spawn` + `JoinHandle`** — fork-join concurrency without passing an executor around
-- 🧪 **Rich test suite** — tests fairness, backpressure, nested spawn, and more
+- 🗄️ **Slab-allocated tasks** — dense vector-backed task storage, no `HashMap` hashing
+- 🧪 **Rich test suite** — 21 tests covering fairness, backpressure, nested spawn, the slab itself, and more
+- 🎓 **Seven runnable examples** — demo, fan-out, pipeline, ping-pong, worker pool, recursive spawn, timeout
 - 📦 **Zero dependencies** — compiles in seconds
 
 ### Why no `Arc<Mutex<>>`?
@@ -123,12 +125,13 @@ run_blocking(async {
 │                    run_blocking()                 │
 │                                                  │
 │  ┌──────────┐   poll    ┌───────────────────┐    │
-│  │ Ready    │ ────────► │ HashMap<id,       │    │
-│  │ Queue    │           │   Pin<Box<Future>> │    │
-│  │ (FIFO)   │ ◄──────── │                   │    │
-│  │ Rc<Ref>  │  re-push  └───────────────────┘    │
-│  └──────────┘                                   │
-│       ▲                    │                     │
+│  │ Ready    │ ────────► │  Slab<id,         │    │
+│  │ Queue    │           │     TaskEntry{    │    │
+│  │ (FIFO)   │ ◄──────── │       future,     │    │
+│  │ Rc<Ref>  │  re-push  │       waker       │    │
+│  └──────────┘           │     }             │    │
+│       ▲                 └───────────────────┘    │
+│       │                    │                     │
 │       │ wake()       Poll::Pending               │
 │       │                    ▼                     │
 │  ┌────┴───────┐    ┌──────────────┐             │
@@ -145,10 +148,30 @@ run_blocking(async {
 ```
 
 1. **`run_blocking`** spawns the user's future as task 0, then enters the poll loop.
-2. Each task is polled. If it returns `Poll::Pending`, it registers its `Waker` (in a timer or channel) and yields.
+2. Each task is polled. If it returns `Poll::Pending`, its `TaskEntry` is re-inserted into the slab at the **same** id (via `Slab::insert_at`) and its `Waker` is registered (in a timer or channel).
 3. When a timer expires or a channel unblocks, `wake()` pushes the task id back onto the ready queue.
 4. If the ready queue is empty, the executor sleeps until the next timer deadline — **zero CPU spin**.
 5. Tasks are polled **FIFO** (round-robin), guaranteeing fairness.
+
+### Task storage: a hand-rolled `Slab<T>`
+
+`src/slab.rs` implements a `Vec<Option<T>>`-backed key/value store. Each
+spawned task gets a monotonically increasing id from `NEXT_ID`, and that
+id is used as the slab key via `Slab::insert_at`. Compared to a `HashMap`
+this gives us:
+
+| Property           | `HashMap<usize, _>` | `Slab<TaskEntry>` |
+|--------------------|---------------------|---------------------|
+| Lookup             | hash + probe        | single bounds check |
+| Cache behaviour    | scattered buckets   | contiguous `Vec`    |
+| Insert at known id | always allowed      | allowed (pad with tombstones) |
+| Remove cost        | O(1)                | O(1)               |
+| Iteration          | walks hash table    | walks a `Vec`      |
+
+Removed slots become tombstones — the vector never shrinks, so old ids
+cannot accidentally resolve to a different task after a slot is reused.
+This is the same pattern used by `tokio::task::JoinSet` and `mio`'s
+token tables, just hand-rolled so we keep **zero external dependencies**.
 
 ### Why no `Arc<Mutex<>>`?
 
@@ -168,22 +191,46 @@ This is the single biggest performance differentiator vs. general-purpose runtim
 src/
 ├── lib.rs          # Public API, thread-local state, spawn()
 ├── executor.rs     # Main poll loop, deadlock detection
+├── slab.rs         # Slab<T> dense task storage
 ├── waker.rs        # TaskWaker (Wake trait impl)
-├── join_handle.rs  # JoinHandle<T> future
+├── join_handle.rs  # JoinHandle<T> future + spawn internals
 ├── sleep.rs        # sleep(), drain_expired()
 └── channel.rs      # bounded_channel(), Sender, Receiver
 examples/
-└── demo.rs         # Runnable demo
+├── demo.rs              # Producer + consumer + ticker
+├── fanout.rs            # One source → K workers via N channels
+├── pipeline.rs          # Three-stage CPU-style pipeline
+├── ping_pong.rs         # Two tasks trading values over two channels
+├── worker_pool.rs       # K workers consuming from a job queue
+├── recursive_spawn.rs   # Tree of spawned tasks (binary, depth D)
+└── timeout.rs           # Race sleep() against a real operation
 ```
 
 | Module | Responsibility |
 |--------|---------------|
 | `lib.rs` | Public re-exports, `spawn()`, thread-local globals |
 | `executor.rs` | `run_blocking()` poll loop, deadlock detection |
+| `slab.rs` | `Slab<T>` — dense vector-backed task storage with `insert_at` |
 | `waker.rs` | Hand-rolled `RawWaker` + vtable using `Rc<TaskWaker>` |
 | `join_handle.rs` | `JoinHandle<T>` future + spawn internals |
 | `sleep.rs` | `sleep()` future + `drain_expired()` for timers |
 | `channel.rs` | `bounded_channel()` — `Sender`, `Receiver`, backpressure |
+
+---
+
+## 🎓 Examples
+
+All examples are runnable with `cargo run --example <name>`.
+
+| Example | What it shows |
+|---------|---------------|
+| [`demo`](examples/demo.rs) | Producer + consumer + timer ticker — the canonical hello-world of async runtimes |
+| [`fanout`](examples/fanout.rs) | One source broadcasting `1..=N` to **K independent workers**, each receiving the full stream |
+| [`pipeline`](examples/pipeline.rs) | Three-stage transformation pipeline (×2, +100, sink) demonstrating stage-to-stage backpressure |
+| [`ping_pong`](examples/ping_pong.rs) | Two tasks trading `"ping"` / `"pong"` over a pair of channels — no shared state at all |
+| [`worker_pool`](examples/worker_pool.rs) | K long-lived workers each with their own inbox; a producer dispatches jobs round-robin |
+| [`recursive_spawn`](examples/recursive_spawn.rs) | A binary tree of spawned tasks where each internal node awaits its two children |
+| [`timeout`](examples/timeout.rs) | The "race `sleep` against the work" timeout pattern — what `select!` would give us for free |
 
 ---
 
@@ -198,13 +245,15 @@ examples/
 | `thread::sleep` on empty queue | Parks the thread exactly until next deadline |
 | `wrapping_add` for task ids | Avoids overflow panics on long-lived executors |
 | `try_recv` non-blocking channel read | Allows polling without suspending |
+| `Slab<TaskEntry>` over `HashMap<usize, _>` | Bounds-checked index lookup, contiguous memory, no hashing |
 
 ### Potential future improvements
 
 - [ ] **Cooperative budgeting** — limit polls per task per tick
 - [ ] **`select!` macro** — race multiple futures
 - [ ] **`LocalWaker` / wake-by-ref** — avoid `Rc` clone on every wake
-- [ ] **Slab allocation** — dense task storage instead of `HashMap`
+- [x] **Slab allocation** — dense task storage instead of `HashMap`
+- [ ] **`Sender::close()` + `recv() → Option<T>`** — let workers drain channels naturally
 - [ ] **`JoinSet`** — collect multiple JoinHandles
 
 ---
