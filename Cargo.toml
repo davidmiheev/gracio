@@ -1,0 +1,19 @@
+[package]
+name = "gracio"
+version = "0.1.0"
+edition = "2024"
+description = "A custom single-threaded async runtime built from scratch — demystifying how async Rust works under the hood."
+license = "MIT"
+repository = "https://github.com/davidmiheev/gracio"
+
+[lib]
+name = "gracio"
+path = "src/lib.rs"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
