@@ -23,31 +23,6 @@ Gracio implements a complete async runtime — executor, wakers, timers, and cha
 - 🎓 **Seven runnable examples** — demo, fan-out, pipeline, ping-pong, worker pool, recursive spawn, timeout
 - 📦 **Zero dependencies** — compiles in seconds
 
-### Why no `Arc<Mutex<>>`?
-
-The standard `std::task::Wake` trait takes `Arc<Self>`, which forces `Arc<Mutex<>>` for any shared mutable state. Gracio instead hand-rolls a `RawWaker` with an `Rc<TaskWaker>` data pointer, bypassing that constraint. See [`src/waker.rs`](src/waker.rs) for the full implementation.
-
-The `Rc` + `RawWakerVTable` dance is the **only** `unsafe` in the entire runtime — and it's a 30-line, well-contained module. The rest of the crate is 100% safe Rust.
-
-```rust
-// src/waker.rs (excerpt) — a complete RawWaker vtable
-unsafe fn waker_clone(data: *const ()) -> RawWaker {
-    unsafe { Rc::increment_strong_count(data as *const TaskWaker) };
-    RawWaker::new(data, &VTABLE)
-}
-unsafe fn waker_wake(data: *const ()) {
-    let rc = unsafe { Rc::from_raw(data as *const TaskWaker) };
-    READY_QUEUE.with(|q| q.borrow_mut().push_back(rc.task_id));
-}
-unsafe fn waker_wake_by_ref(data: *const ()) {
-    let task_id = unsafe { (*(data as *const TaskWaker)).task_id };
-    READY_QUEUE.with(|q| q.borrow_mut().push_back(task_id));
-}
-unsafe fn waker_drop(data: *const ()) {
-    let _ = unsafe { Rc::from_raw(data as *const TaskWaker) };
-}
-```
-
 ---
 
 ## 🚀 Quick Start
@@ -182,6 +157,29 @@ Because Gracio is strictly single-threaded, we use `Rc<RefCell<>>` everywhere. T
 - `Send + Sync` trait noise
 
 This is the single biggest performance differentiator vs. general-purpose runtimes.
+
+The standard `std::task::Wake` trait takes `Arc<Self>`, which forces `Arc<Mutex<>>` for any shared mutable state. Gracio instead hand-rolls a `RawWaker` with an `Rc<TaskWaker>` data pointer, bypassing that constraint. See [`src/waker.rs`](src/waker.rs) for the full implementation.
+
+The `Rc` + `RawWakerVTable` dance is the **only** `unsafe` in the entire runtime — and it's a 30-line, well-contained module. The rest of the crate is 100% safe Rust.
+
+```rust
+// src/waker.rs (excerpt) — a complete RawWaker vtable
+unsafe fn waker_clone(data: *const ()) -> RawWaker {
+    unsafe { Rc::increment_strong_count(data as *const TaskWaker) };
+    RawWaker::new(data, &VTABLE)
+}
+unsafe fn waker_wake(data: *const ()) {
+    let rc = unsafe { Rc::from_raw(data as *const TaskWaker) };
+    READY_QUEUE.with(|q| q.borrow_mut().push_back(rc.task_id));
+}
+unsafe fn waker_wake_by_ref(data: *const ()) {
+    let task_id = unsafe { (*(data as *const TaskWaker)).task_id };
+    READY_QUEUE.with(|q| q.borrow_mut().push_back(task_id));
+}
+unsafe fn waker_drop(data: *const ()) {
+    let _ = unsafe { Rc::from_raw(data as *const TaskWaker) };
+}
+```
 
 ---
 
